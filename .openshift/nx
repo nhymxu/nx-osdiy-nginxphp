@@ -9,6 +9,7 @@ unset GIT_DIR
 
 umask 077
 
+unset TMOUT
 ###################################
 
 #
