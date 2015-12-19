@@ -1,0 +1,49 @@
+#!/bin/bash
+
+set -e
+
+###################################
+
+#
+# BEGIN Load common
+#
+
+export OPENSHIFT_RUNTIME_DIR=${OPENSHIFT_DIY_DIR}/runtime/
+export OPENSHIFT_RUN_DIR=${OPENSHIFT_DIY_DIR}/run/
+export OPENSHIFT_BIN=${OPENSHIFT_RUNTIME_DIR}/bin/
+
+export PATH=${OPENSHIFT_BIN}:$PATH
+
+# When using rockmongo this is set and can cause strange errors here
+export PHPRC=${OPENSHIFT_RUNTIME_DIR}/etc/php/
+
+#
+# END Load common
+#
+
+###################################
+
+BUILD_DIR=${OPENSHIFT_TMP_DIR}/build
+NGINX_DIR=${OPENSHIFT_RUNTIME_DIR}/nginx/
+PHP_DIR=${OPENSHIFT_RUNTIME_DIR}/php/
+TEMPLATE_DIR=${OPENSHIFT_REPO_DIR}/.openshift/tmpl
+
+umask 077
+
+mkdir -p ${BUILD_DIR}
+
+echo "Pre-processing nginx config."
+cp ${TEMPLATE_DIR}/nginx.conf.tmpl ${BUILD_DIR}/nginx.conf
+perl -p -i -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' ${BUILD_DIR}/nginx.conf
+cp ${BUILD_DIR}/nginx.conf ${NGINX_DIR}/conf/nginx.conf
+
+echo "Pre-processing PHP-fpm config."
+cp ${TEMPLATE_DIR}/php-fpm.conf.tmpl ${BUILD_DIR}/php-fpm.conf
+perl -p -i -e 's/\$\{([^}]+)\}/defined $ENV{$1} ? $ENV{$1} : $&/eg' ${BUILD_DIR}/php-fpm.conf
+cp ${BUILD_DIR}/php-fpm.conf ${PHP_DIR}/etc/php-fpm.conf
+
+rm -rf ${BUILD_DIR}
+
+bash_profile=${OPENSHIFT_DATA_DIR}/.bash_profile
+echo "Copy bash profile."
+cp ${TEMPLATE_DIR}/bash_profile.tmpl ${bash_profile}

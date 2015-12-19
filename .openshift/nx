@@ -1,0 +1,592 @@
+#!/bin/bash
+
+# Exit on first error.
+set -e
+
+# OpenShift sets GIT_DIR to . which terminates pull with an error:
+# Not a git repository: '.'
+unset GIT_DIR
+
+umask 077
+
+###################################
+
+#
+# BEGIN Load common
+#
+
+export OPENSHIFT_RUNTIME_DIR=${OPENSHIFT_DIY_DIR}/runtime/
+export OPENSHIFT_RUN_DIR=${OPENSHIFT_DIY_DIR}/run/
+export OPENSHIFT_BIN=${OPENSHIFT_RUNTIME_DIR}/bin/
+
+export PATH=${OPENSHIFT_BIN}:$PATH
+
+# When using rockmongo this is set and can cause strange errors here
+export PHPRC=${OPENSHIFT_RUNTIME_DIR}/etc/php/
+
+#
+# END Load common
+#
+
+###################################
+
+# Configure versions
+NGINX_VERSION='1.9.7'
+ZLIB_VERSION='1.2.8'
+PCRE_VERSION='8.38'
+
+PHP_VERSION='7.0.1'
+ICU_VERSION='56.1'
+
+LIBMCRYPT_VERSION='2.5.8'
+LIBTOOL_VERSION='2.4.6'
+RE2C_VERSION='0.15.3'
+BISON_VERSION='3.0.4'
+
+# Uncomment the following install it.
+#NODE_VERSION='0.12.0'
+#PHALCON_VERSION='1.3.4'
+
+declare -A PHP_PECL
+declare -A PHP_PECL_CONFIGURE
+# PHP_PECL=( ["mongo"]='1.6.12' ["apcu"]='5.1.0' )
+PHP_PECL=( ["apcu"]='5.1.0' )
+PHP_PECL_CONFIGURE=( )
+
+# Setup dir references
+ROOT_DIR=${OPENSHIFT_RUNTIME_DIR}
+BUILD_DIR=${OPENSHIFT_TMP_DIR}/build
+CONFIG_DIR=${OPENSHIFT_DIY_DIR}/conf
+TEMPLATE_DIR=${OPENSHIFT_REPO_DIR}/.openshift/tmpl
+
+# Push the libs path to the PATH
+export PATH=${OPENSHIFT_RUNTIME_DIR}/libs/bin:${OPENSHIFT_BIN}:$PATH
+
+###################################
+
+#
+# BEGIN Load function
+#
+
+########## Build Util ##########
+function download_and_unpack() {
+    if [ -z "${1}" ] || [ -z "${2}" ]; then
+        echo "download_and_unpack: expected two arguments"
+        return 1
+    fi
+
+    local pkg=${1}
+    local pkg_url=${2}
+
+    # Determin the extraction directory
+    local extract_dir=''
+    if [ ! -z "${3}" ]; then
+        extract_dir="${3}"
+    else
+        local pkg_len=${#pkg}
+        if [[ "${pkg}" == *'.tar.gz' ]]; then
+            extract_len=$((pkg_len - 7))
+        elif [[ "${pkg}" == *'.tgz' ]]; then
+            extract_len=$((pkg_len - 4))
+        elif [[ "${pkg}" == *'.tar.bz2' ]]; then
+            extract_len=$((pkg_len - 8))
+        else
+            echo "ERROR: ${pkg} unknown extension."
+            exit -1
+        fi
+        extract_dir="${pkg:0:extract_len}"
+    fi
+
+    # Determin extract arguments
+    local extract_args=xfz
+    if [[ "${pkg}" == *'.tar.bz2' ]]; then
+        extract_args=xfj
+    fi
+
+    # Download the package
+    echo "Downloading ${pkg}:"
+    if [ ! -f "${pkg}" ] || [ ! -d "${extract_dir}" ]; then
+        wget --progress=dot --output-document=./${pkg} ${pkg_url}
+        echo "- done"
+    else
+        echo "- skipping file exists."
+    fi
+
+    # Check file (incase openshift hangsup)
+    echo "Unpacking ${pkg}:"
+    local check_file=`md5sum ${pkg} | awk '{ print $1 }'`
+    if [ -f ${check_file} ]; then
+        echo "- cleaning failure."
+        # We know extraction failed previously
+        # So remove that folder
+        rm -rf "${extract_dir}"
+    elif [ -d "${extract_dir}" ]; then
+        # The directory exists so don't extract again
+        echo "- skipping directory exists."
+        return 0
+    fi
+
+    # Extract
+    touch ${check_file}
+    tar ${extract_args} "${pkg}"
+
+    # Done so remove the check file
+    rm ${check_file}
+    echo "- done."
+
+    return 0
+}
+
+########## Build Nginx ##########
+function install_nginx() {
+    local pkg=nginx-${NGINX_VERSION}.tar.gz
+    local pkg_pcre=pcre-${PCRE_VERSION}.tar.bz2
+    local pkg_zlib=zlib-${ZLIB_VERSION}.tar.gz
+
+    mkdir -p ${BUILD_DIR}
+    mkdir -p ${ROOT_DIR}/etc/nginx
+    pushd ${BUILD_DIR}
+
+    # Get packages
+    download_and_unpack ${pkg_pcre} ftp://ftp.csx.cam.ac.uk/pub/software/programming/pcre/${pkg_pcre}
+    download_and_unpack ${pkg_zlib} http://zlib.net/${pkg_zlib}
+    download_and_unpack ${pkg} http://nginx.org/download/${pkg}
+    pushd nginx-${NGINX_VERSION}
+
+    echo "Configuring nginx."
+    ./configure \
+        --with-http_ssl_module \
+        --with-http_sub_module \
+        --with-zlib=${BUILD_DIR}/zlib-${ZLIB_VERSION} \
+        --with-pcre=${BUILD_DIR}/pcre-${PCRE_VERSION} \
+        --with-http_ssl_module \
+        --with-http_realip_module \
+        --with-http_gzip_static_module \
+        --with-ipv6 \
+        --prefix=${ROOT_DIR}/nginx
+
+    echo "Compiling nginx."
+    make install
+
+    echo "Cleaning build directory."
+    popd
+    popd
+    rm -rf ${BUILD_DIR}
+}
+
+function check_nginx() {
+    local nginx_bin=${ROOT_DIR}/nginx/sbin/nginx
+
+    if [[ ! -e  ${nginx_bin} ]]; then
+        echo "nginx not installed."
+        install_nginx
+    else
+        local nginx_version=`${nginx_bin} -v 2>&1|cut -d/ -f2`
+
+        if [[ ${NGINX_VERSION} != ${nginx_version} ]]; then
+            echo "nginx old, version: ${nginx_version}."
+            install_nginx
+        else
+            echo "nginx up to date, version: ${nginx_version}."
+        fi
+    fi
+}
+
+########## Build PHP Libs ##########
+function check_libtool() {
+    local libtool_bin=${ROOT_DIR}/libs/bin/libtool
+    if [[ ! -e  ${libtool_bin} ]]; then
+        echo "Libtool not installed."
+        install_libtool
+    else
+        local libtool_version=`${libtool_bin} --version | head -n 1 | grep -oh '[0-9.]*$' | tr -d '\n'`
+
+        if [[ ${LIBTOOL_VERSION} != ${libtool_version} ]]; then
+            echo "Libtool old, version: ${libtool_version}."
+            install_libtool
+        else
+            echo "Libtool up to date, version: ${libtool_version}."
+        fi
+    fi
+}
+
+function install_libtool() {
+    local pkg=libtool-${LIBTOOL_VERSION}.tar.gz
+    local ts=`date +%s`
+
+    mkdir -p ${BUILD_DIR}
+    pushd ${BUILD_DIR}
+
+    # Get archive
+    download_and_unpack ${pkg} http://gnu.xl-mirror.nl/libtool/${pkg}
+    pushd libtool-${LIBTOOL_VERSION}
+
+    echo "Configuring Libtool."
+    mkdir -p ${ROOT_DIR}/libs/lib64/
+    ./configure --prefix=${ROOT_DIR}/libs/ --libdir=${ROOT_DIR}/libs/lib64
+    echo "Compiling Libtool."
+    make install
+
+    popd
+    popd
+    rm -rf ${BUILD_DIR}
+}
+
+function install_libmcrypt() {
+    local pkg=libmcrypt-${LIBMCRYPT_VERSION}.tar.gz
+    local ts=`date +%s`
+
+    mkdir -p ${BUILD_DIR}
+    pushd ${BUILD_DIR}
+
+    # Get archive
+    download_and_unpack ${pkg} "http://sourceforge.net/projects/mcrypt/files/Libmcrypt/${LIBMCRYPT_VERSION}/${pkg}/download?r=http%3A%2F%2Fsourceforge.net%2Fprojects%2Fmcrypt%2F&ts=${ts}&use_mirror=freefr"
+    pushd libmcrypt-${LIBMCRYPT_VERSION}
+
+    echo "Configuring LibMCrypt."
+    mkdir -p ${ROOT_DIR}/libs/lib64/
+    ./configure \
+        --disable-posix-threads \
+        --enable-dynamic-loading \
+		--disable-shared \
+		--with-included-algos=cbc,cfb,ctr,ecb,ncfb,nofb,ofb,stream,cast-128,gost,rijndael-128,twofish,arcfour,cast-256,loki97,rijndael-192,saferplus,wake,blowfish-compat,des,rijndael-256,serpent,xtea,blowfish,enigma,rc2,tripledes \
+        --prefix=${ROOT_DIR}/libs/ \
+        --libdir=${ROOT_DIR}/libs/lib64/
+    echo "Compiling LibMCrypt."
+    make install
+
+    popd
+    popd
+    rm -rf ${BUILD_DIR}
+}
+
+function check_libmcrypt() {
+    check_libtool
+
+    local mcrypt_bin=${ROOT_DIR}/libs/bin/libmcrypt-config
+    if [[ ! -e  ${mcrypt_bin} ]]; then
+        echo "LibMCrypt not installed."
+        install_libmcrypt
+    else
+        local mcrypt_version=`${mcrypt_bin} --version | tr -d '\n'`
+
+        if [[ ${LIBMCRYPT_VERSION} != ${mcrypt_version} ]]; then
+            echo "LibMCrypt old, version: ${mcrypt_version}."
+            install_libmcrypt
+        else
+            echo "LibMCrypt up to date, version: ${mcrypt_version}."
+        fi
+    fi
+}
+
+function install_icu() {
+    local pkg=icu4c-${ICU_VERSION//./_}-src.tgz
+
+    mkdir -p ${BUILD_DIR}
+    pushd ${BUILD_DIR}
+
+    # Get archive
+    download_and_unpack ${pkg} http://download.icu-project.org/files/icu4c/${ICU_VERSION}/${pkg} icu
+    pushd icu/source/
+
+    echo "Configuring ICU."
+    chmod +x runConfigureICU configure install-sh
+    ./configure \
+        --prefix=${ROOT_DIR}/libs/
+
+    echo "Compiling ICU."
+    make install
+
+    echo "Cleaning build directory."
+    popd
+    popd
+    rm -rf ${BUILD_DIR}
+}
+
+function check_icu() {
+    local icu_bin=${ROOT_DIR}/libs/bin/icu-config
+    if [[ ! -e  ${icu_bin} ]]; then
+        echo "ICU not installed."
+        install_icu
+    else
+        local icu_version=`${icu_bin} --version | tr -d '\n'`
+
+        if [[ ${ICU_VERSION} != ${icu_version} ]]; then
+            echo "ICU old, version: ${icu_version}."
+            install_icu
+        else
+            echo "ICU up to date, version: ${icu_version}."
+        fi
+    fi
+}
+
+function install_bison() {
+    local pkg=bison-${BISON_VERSION}.tar.gz
+
+    mkdir -p ${BUILD_DIR}
+    pushd ${BUILD_DIR}
+
+    # Get archive
+    download_and_unpack ${pkg} http://ftp.gnu.org/gnu/bison/${pkg}
+    pushd bison-${BISON_VERSION}
+
+    echo "Configuring Bison."
+    ./configure --prefix=${ROOT_DIR}/libs/ --libdir=${ROOT_DIR}/libs/lib64
+
+    echo "Compiling Bison."
+    make install
+
+    popd
+    popd
+    rm -rf ${BUILD_DIR}
+}
+
+function check_bison() {
+    local bin=${ROOT_DIR}/libs/bin/bison
+    if [[ ! -e  ${bin} ]]; then
+        echo "Bison not installed."
+        install_bison
+    else
+        local version=`${bin} --version | head -n 1 | grep -oh '[0-9.]*' | head -n 1 | tr -d '\n'`
+
+        if [[ ${version} != "${BISON_VERSION}"* ]]; then
+            echo "Bison old, version: ${version}."
+            install_bison
+        else
+            echo "Bison up to date, version: ${version}."
+        fi
+    fi
+}
+
+function install_re2c() {
+    # Remark if not in PATH add RE2C=${ROOT_DIR}/libs/bin/re2c to php ./configure
+    local pkg=re2c-${RE2C_VERSION}.tar.gz
+    local ts=`date +%s`
+
+    mkdir -p ${BUILD_DIR}
+    pushd ${BUILD_DIR}
+
+    # Get archive
+    # download_and_unpack ${pkg} "http://sourceforge.net/projects/re2c/files/re2c/${RE2C_VERSION}/${pkg}/download?r=http%3A%2F%2Fsourceforge.net%2Fprojects%2Fre2c%2F&ts=${ts}&use_mirror=freefr"
+    download_and_unpack ${pkg} "http://downloads.sourceforge.net/project/re2c/${RE2C_VERSION}/${pkg}?r=http%3A%2F%2Fsourceforge.net%2Fprojects%2Fre2c%2Ffiles%2F${RE2C_VERSION}%2F${pkg}%2Fdownload&ts=${ts}&use_mirror=jaist"
+    pushd re2c-${RE2C_VERSION}
+
+    echo "Configuring Re2c."
+    mkdir -p ${ROOT_DIR}/libs/lib64/
+    ./configure --prefix=${ROOT_DIR}/libs/ --libdir=${ROOT_DIR}/libs/lib64
+
+    echo "Compiling Re2c."
+    make install
+
+    popd
+    popd
+    rm -rf ${BUILD_DIR}
+}
+
+function check_re2c() {
+    local re2c_bin=${ROOT_DIR}/libs/bin/re2c
+    if [[ ! -e  ${re2c_bin} ]]; then
+        echo "Re2c not installed."
+        install_re2c
+    else
+        local version=`${re2c_bin} --version | head -n 1 | grep -oh '[0-9.]*$' | tr -d '\n'`
+
+        if [[ ${RE2C_VERSION} != ${version} ]]; then
+            echo "Re2c old, version: ${version}."
+            install_re2c
+        else
+            echo "Re2c up to date, version: ${version}."
+        fi
+    fi
+}
+
+########## Build PHP ##########
+function install_php() {
+    check_libmcrypt
+    check_icu
+    check_bison
+    check_re2c
+
+    local pkg=php-${PHP_VERSION}.tar.gz
+
+    mkdir -p ${BUILD_DIR}
+    mkdir -p ${ROOT_DIR}/etc/php/conf.d
+    pushd ${BUILD_DIR}
+
+    # Get archive
+    download_and_unpack ${pkg} http://www.php.net/get/${pkg}/from/us1.php.net/mirror
+    pushd php-${PHP_VERSION}
+
+    if [[ ! -f config.log || `tail -n 1 config.log | tr -d '\n'` !=  'configure: exit 0' ]]; then
+        echo "Configuring PHP."
+        ./configure \
+            --with-libdir=lib64 \
+            --prefix=${ROOT_DIR}/php \
+            --with-config-file-path=${ROOT_DIR}/etc/php/ \
+            --with-config-file-scan-dir=${ROOT_DIR}/etc/php/conf.d/ \
+            --with-icu-dir=${ROOT_DIR}/libs \
+            --with-mcrypt=${ROOT_DIR}/libs \
+            --with-layout=PHP \
+            --with-curl \
+            --with-pear \
+            --with-zlib \
+            --with-mhash \
+            --with-pgsql \
+            --with-mysqli \
+            --with-pdo-mysql \
+            --with-pdo-pgsql \
+            --with-openssl \
+            --with-xmlrpc \
+            --with-xsl \
+            --with-bz2 \
+            --with-gettext \
+            --with-readline \
+            --with-fpm-user=www-data \
+            --with-fpm-group=www-data \
+            --with-kerberos \
+            --with-gd \
+            --with-jpeg-dir \
+            --with-png-dir \
+            --with-png-dir \
+            --with-xpm-dir \
+            --with-freetype-dir \
+            --enable-gd-native-ttf \
+            --disable-debug \
+            --enable-fpm \
+            --enable-cli \
+            --enable-inline-optimization \
+            --enable-exif \
+            --enable-wddx \
+            --enable-zip \
+            --enable-bcmath \
+            --enable-calendar \
+            --enable-ftp \
+            --enable-mbstring \
+            --enable-soap \
+            --enable-sockets \
+            --enable-shmop \
+            --enable-dba \
+            --enable-sysvsem \
+            --enable-sysvshm \
+            --enable-sysvmsg \
+            --enable-intl \
+            --enable-opcache \
+			--disable-fileinfo
+    fi
+
+    echo "Compiling PHP."
+    make install
+
+    # Copy configuration file
+    local ini=${TEMPLATE_DIR}/php.ini.tmpl
+    if [[ -e  ${ini} ]]; then
+        echo "Copy ini for ${1}."
+        yes | cp ${ini} ${ROOT_DIR}/etc/php/php.ini
+    else
+        echo "Copy php.ini from php.ini-production."
+        yes | cp php.ini-production ${ROOT_DIR}/etc/php/php.ini
+    fi
+    local ini=${TEMPLATE_DIR}/php_extra.ini.tmpl
+    if [[ -e  ${ini} ]]; then
+        echo "Copy ini for ${1}."
+        yes | cp ${ini} ${ROOT_DIR}/etc/php/conf.d/php_extra.ini
+    fi
+
+    echo "Cleaning build directory."
+    popd
+    popd
+    rm -rf ${BUILD_DIR}
+}
+
+function check_php() {
+    local php_bin=${ROOT_DIR}/php/bin/php
+
+    if [[ ! -e  ${php_bin} ]]; then
+        echo "PHP not installed."
+        install_php
+    else
+        local php_version=`${php_bin} -r "echo phpversion();"`
+
+        if [[ ${PHP_VERSION} != ${php_version} ]]; then
+            echo "PHP old, version: ${php_version}."
+            install_php
+        else
+            echo "PHP up to date, version: ${php_version}."
+        fi
+    fi
+}
+
+function install_pecl() {
+    if [ -z "${1}" ] || [ -z "${2}" ]; then
+        echo "check_pecl: expected two arguments"
+        return 1
+    fi
+
+    local pkg=${1}-${2}.tgz
+
+    mkdir -p ${BUILD_DIR}
+    pushd ${BUILD_DIR}
+
+    # Get archive
+    download_and_unpack ${pkg} http://pecl.php.net/get/${pkg}
+    pushd ${1}-${2}
+
+    echo "Configuring ${1}."
+    ${ROOT_DIR}/php/bin/phpize -clean
+    ./configure \
+        --with-php-config=${ROOT_DIR}/php/bin/php-config \
+        ${3}
+
+    echo "Compiling ${1}."
+    make install
+
+    # Copy configuration files
+    local ini=${TEMPLATE_DIR}/pecl/${1,,}.ini.tmpl
+    if [[ -e  ${ini} ]]; then
+        echo "Copy ini for ${1}."
+        yes | cp ${ini} ${ROOT_DIR}/etc/php/conf.d/${1,,}.ini
+    fi
+
+    echo "Cleaning build directory."
+    popd
+    popd
+    rm -rf ${BUILD_DIR}
+}
+
+function check_pecl() {
+    if [ -z "${1}" ] || [ -z "${2}" ]; then
+        echo "check_pecl: expected two arguments"
+        return 1
+    fi
+
+    local php_bin=${ROOT_DIR}/php/bin/php
+    local pecl_version=`${php_bin} -r "echo phpversion('${1}');"`
+
+    if [[ ${2} != ${pecl_version} ]]; then
+        echo "PHP pecl ${1} not installed or old version ${pecl_version}."
+        install_pecl ${1} ${2} ${3}
+    else
+        echo "PHP pecl ${1} up to date, version: ${2}."
+    fi
+}
+
+#
+# END Load function
+#
+
+###################################
+
+# Check nginx
+check_nginx
+
+# Check PHP
+check_php
+
+# Check pecl extensions
+for ext in "${!PHP_PECL[@]}"; do
+    check_pecl ${ext} ${PHP_PECL["$ext"]} ${PHP_PECL_CONFIGURE["$ext"]};
+done
+
+# Extra
+#source ${OPENSHIFT_REPO_DIR}/.openshift/action_hooks/build_node
+#source ${OPENSHIFT_REPO_DIR}/.openshift/action_hooks/build_phalcon
