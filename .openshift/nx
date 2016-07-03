@@ -32,16 +32,16 @@ export PHPRC=${OPENSHIFT_RUNTIME_DIR}/etc/php/
 ###################################
 
 # Configure versions
-NGINX_VERSION='1.9.7'
+NGINX_VERSION='1.11.1'
 ZLIB_VERSION='1.2.8'
-PCRE_VERSION='8.38'
+PCRE_VERSION='8.39'
 
-PHP_VERSION='7.0.1'
-ICU_VERSION='56.1'
+PHP_VERSION='7.0.8'
+ICU_VERSION='57.1'
 
 LIBMCRYPT_VERSION='2.5.8'
 LIBTOOL_VERSION='2.4.6'
-RE2C_VERSION='0.15.3'
+RE2C_VERSION='0.16'
 BISON_VERSION='3.0.4'
 
 # Uncomment the following install it.
@@ -51,7 +51,7 @@ BISON_VERSION='3.0.4'
 declare -A PHP_PECL
 declare -A PHP_PECL_CONFIGURE
 # PHP_PECL=( ["mongo"]='1.6.12' ["apcu"]='5.1.0' )
-PHP_PECL=( ["apcu"]='5.1.0' )
+PHP_PECL=( ["apcu"]='5.1.5' )
 PHP_PECL_CONFIGURE=( )
 
 # Setup dir references
